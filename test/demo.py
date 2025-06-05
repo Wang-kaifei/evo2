@@ -417,11 +417,6 @@ def main():
         sequences = read_prompts('vortex/test/data/output.csv')
     except Exception as e:
         print(f"Warning: Failed to read from CSV file: {str(e)}")
-        print("Using default test sequences instead.")
-        sequences = ["Hello, how are you today?", 
-                    "What is the capital of France?",
-                    "Explain the concept of machine learning.",
-                    "Write a simple Python function to calculate factorial."]
     
     if args.compare:
         # 进行原始模型和 ParScale 的对比测试
