@@ -6,19 +6,37 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# Increase CSV field size limit
+import sys
+csv.field_size_limit(sys.maxsize)
+
 from evo2 import Evo2
 
 def read_prompts(input_file: Path) -> Union[List[List[str]]]:
     """Read prompts from input file."""
     promptseqs: List[str] = []
     
-    with open(input_file, encoding='utf-8-sig', newline='') as csvfile:
-        reader = csv.reader(csvfile)
-        next(reader)  # Skip header
-        for row in reader:
-            promptseqs.append(row[0])
-
-    return promptseqs
+    try:
+        with open(input_file, encoding='utf-8-sig', newline='') as csvfile:
+            reader = csv.reader(csvfile)
+            header = next(reader)  # Skip header
+            if not header:
+                raise ValueError("Empty CSV file")
+            
+            # Read only first 10 rows after header (total 11 lines including header)
+            for i, row in enumerate(reader):
+                if i >= 10:  # Stop after reading 10 rows
+                    break
+                if row and len(row) > 0:  # Check if row is not empty
+                    promptseqs.append(row[0])
+        
+        if not promptseqs:
+            raise ValueError("No sequences found in the CSV file")
+            
+        return promptseqs
+    except Exception as e:
+        print(f"Error reading prompts file: {str(e)}")
+        raise
 
 def test_forward_pass(*, model, sequences):
     """Test model forward pass accuracy on sequences."""
@@ -81,10 +99,12 @@ def main():
     torch.cuda.manual_seed(1)
     
     # Initialize model
-    model = Evo2(args.model_name)
+    model_path = f"/root/EVO/ckpt/{args.model_name}.pt"
+    config_path = f"/root/EVO/evo2/configs/{args.model_name.replace('_', '-')}.yml"
+    model = Evo2(args.model_name, local_path=model_path)
     
     # Read sequences
-    sequences = read_prompts('vortex/test/data/prompts.csv')
+    sequences = read_prompts('vortex/test/data/output.csv')
     
     # Test forward pass
     accuracies, losses = test_forward_pass(

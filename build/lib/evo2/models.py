@@ -186,20 +186,6 @@ class Evo2:
             print(f"Loading model from {local_path}...")
             print(f"Loading config from {config_path}...")
             config = dotdict(yaml.load(open(config_path), Loader=yaml.FullLoader))
-            
-            # Add FP8 recipe if using FP8
-            if config.get('use_fp8_input_projections', False):
-                from transformer_engine.pytorch import fp8
-                fp8_recipe = fp8.FP8Recipe(
-                    margin=0,
-                    interval=1,
-                    fp8_format=fp8.FP8Format.E4M3,
-                    amax_history_len=16,
-                    amax_compute_algo="max"
-                )
-                # Set global FP8 recipe
-                fp8.set_global_fp8_recipe(fp8_recipe)
-            
             model = StripedHyena(config)
             load_checkpoint(model, local_path)
             return model
