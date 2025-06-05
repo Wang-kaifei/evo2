@@ -82,19 +82,10 @@ def main():
     config_path = f"/root/EVO/evo2/configs/{args.model_name.replace('_', '-')}.yml"
     model = Evo2(args.model_name, local_path=model_path)
     
-    # 读取训练序列
-    try:
-        with open('/root/EVO/evo2/vortex/test/data/output.csv', 'r', encoding='utf-8-sig') as f:
-            # 跳过标题行，只读取第一列（DNA序列）
-            sequences = [line.strip().split(',')[0] for line in f.readlines()[1:11]]
-    except Exception as e:
-        print(f"Warning: Failed to read from CSV file: {str(e)}")
-        print("Using default test sequences instead.")
-        exit()
-    
-    # 收集训练数据
-    print("Collecting training data...")
-    data = collect_training_data(model, sequences, args.n_parscale, args.data_dir)
+    # 加载训练数据
+    collector = DataCollector(args.data_dir)
+    data = collector.load("training_data.json")
+    print(f"Loaded {len(data)} training samples")
     
     if args.collect_only:
         return
@@ -103,6 +94,9 @@ def main():
     train_size = int(0.8 * len(data))
     train_data = data[:train_size]
     val_data = data[train_size:]
+    
+    print(f"Training set size: {len(train_data)}")
+    print(f"Validation set size: {len(val_data)}")
     
     train_loader = DataLoader(train_data, args.batch_size)
     val_loader = DataLoader(val_data, args.batch_size)

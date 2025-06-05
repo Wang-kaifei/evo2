@@ -14,24 +14,22 @@ class SimpleParScaleWrapper:
         # 获取模型的数据类型
         self.dtype = next(model.model.parameters()).dtype
         
-        # 初始化扰动强度
+        # 初始化扰动强度 - 使用更大的范围和更细的间隔
         self.noise_scales = torch.nn.Parameter(
-            torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], 
+            torch.tensor([0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75], 
                         device='cuda:0', dtype=self.dtype)
         )
         
-        # 初始化丢弃率
-        self.dropout_rates = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+        # 初始化丢弃率 - 使用更大的范围和更细的间隔
+        self.dropout_rates = torch.tensor([0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75],
                                         device='cuda:0', dtype=self.dtype)
     
     def apply_scale_specific_perturbation(self, logits, scale_idx, seq_len):
         """对每个尺度应用特定的扰动模式"""
         batch_size, seq_len, hidden_size = logits.shape
         
-        if scale_idx == 0:  # 随机丢弃：完全随机
-            mask = (torch.rand_like(logits) > self.dropout_rates[scale_idx]).bool()
-            noise = torch.randn_like(logits) * self.noise_scales[scale_idx]
-            noise = noise * (1.0 - mask.float())
+        if scale_idx == 0:  # 原始输出：不做任何扰动
+            return torch.zeros_like(logits)
             
         elif scale_idx == 1:  # 随机丢弃：每隔一个位置
             mask = torch.ones_like(logits, dtype=torch.bool)

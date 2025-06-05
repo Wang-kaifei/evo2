@@ -17,7 +17,7 @@ class DataCollector:
         
         Args:
             context: 输入序列 [batch_size, seq_len]
-            predictions: 所有scale的预测 [n_parscale, batch_size, seq_len-1]
+            predictions: 所有scale的预测 [n_parscale, batch_size, seq_len]
             scale_features: scale特征 [n_parscale, 2]
             target: 目标序列 [batch_size, seq_len-1]
         """
@@ -32,25 +32,37 @@ class DataCollector:
         is_correct = (predictions == target.unsqueeze(0)).float()  # [n_parscale, batch_size, seq_len-1]
         
         # 对每个位置，找到预测正确的流的索引
-        # 如果有多个正确的scale，选择noise_scale最小的那个（最稳定的）
         correct_mask = is_correct > 0  # [n_parscale, batch_size, seq_len-1]
-        noise_scales = scale_features[:, 0].view(-1, 1, 1)  # [n_parscale, 1, 1]
         
-        # 将不正确的预测的noise_scale设为无穷大
-        masked_noise_scales = torch.where(
-            correct_mask,
-            noise_scales,
-            torch.full_like(noise_scales, float('inf'))
-        )
+        # 检查每个位置是否所有scale预测都相同
+        all_same = (predictions == predictions[0:1]).all(dim=0)  # [batch_size, seq_len-1]
         
-        # 选择noise_scale最小的正确预测
-        correct_indices = masked_noise_scales.argmin(dim=0)  # [batch_size, seq_len-1]
+        # 对每个位置，找出所有预测正确的scale
+        correct_scales = torch.nonzero(correct_mask, as_tuple=True)[0]  # [n_correct]
+        batch_indices = torch.nonzero(correct_mask, as_tuple=True)[1]  # [n_correct]
+        pos_indices = torch.nonzero(correct_mask, as_tuple=True)[2]  # [n_correct]
         
-        print(f"context.shape: {context.shape}")    
-        print(f"predictions.shape: {predictions.shape}")
-        print(f"is_correct.shape: {is_correct.shape}")
-        print(f"target.shape: {target.shape}")
-        print(f"correct_indices.shape: {correct_indices.shape}")
+        # 初始化correct_indices为-1（表示没有正确的预测或所有预测相同）
+        correct_indices = torch.full((batch_size, seq_len-1), -1, device=context.device)
+        
+        # 对每个位置，选择一个scale
+        for b in range(batch_size):
+            for t in range(seq_len-1):
+                # 如果所有scale预测都相同，保持-1
+                if all_same[b, t]:
+                    correct_indices[b, t] = -1
+                    continue
+                    
+                # 找出当前位置所有正确的scale
+                pos_mask = (batch_indices == b) & (pos_indices == t)
+                if pos_mask.any():
+                    # 如果有正确的预测，从正确的scale中随机选择一个
+                    correct_scales_pos = correct_scales[pos_mask]
+                    selected_scale = correct_scales_pos[torch.randint(0, len(correct_scales_pos), (1,), device=context.device)]
+                    correct_indices[b, t] = selected_scale
+                else:
+                    # 如果没有正确的预测，保持-1
+                    correct_indices[b, t] = -1
         
         # 保存数据
         for b in range(batch_size):
@@ -90,11 +102,26 @@ class DataCollector:
 
 class DataLoader:
     """数据加载器"""
-    def __init__(self, data: List[Dict[str, Any]], batch_size: int = 32):
+    def __init__(self, data: List[Dict[str, Any]], batch_size: int = 32, max_seq_len: int = 1024):
         self.data = data
         self.batch_size = batch_size
+        self.max_seq_len = max_seq_len
         self.n_samples = len(data)
         self.n_batches = (self.n_samples + batch_size - 1) // batch_size
+    
+    def pad_sequence(self, seq: List[int], max_len: int) -> List[int]:
+        """将序列填充到指定长度
+        
+        Args:
+            seq: 输入序列
+            max_len: 目标长度
+            
+        Returns:
+            填充后的序列
+        """
+        if len(seq) > max_len:
+            return seq[:max_len]
+        return seq + [0] * (max_len - len(seq))
     
     def __iter__(self):
         """迭代器"""
@@ -103,11 +130,24 @@ class DataLoader:
             batch_indices = indices[i:i + self.batch_size]
             batch_data = [self.data[idx] for idx in batch_indices]
             
-            # 准备批次数据
-            context = torch.tensor([d['context'] for d in batch_data])
-            predictions = torch.tensor([d['predictions'] for d in batch_data]).transpose(0, 1)
-            scale_features = torch.tensor([d['scale_features'] for d in batch_data])
-            correct_scales = torch.tensor([d['correct_scale'] for d in batch_data])
+            # 获取当前批次中最长序列的长度
+            max_len = min(max(len(d['context']) for d in batch_data), self.max_seq_len)
+            
+            # 准备批次数据，并进行填充
+            context = torch.tensor([self.pad_sequence(d['context'], max_len) for d in batch_data]).to('cuda:0')
+            
+            # 处理预测结果
+            n_parscale = len(batch_data[0]['predictions'])  # 获取并行scale数量
+            padded_predictions = []
+            for d in batch_data:
+                # 对每个样本的每个scale的预测进行填充
+                sample_predictions = [self.pad_sequence(pred, max_len-1) for pred in d['predictions']]
+                padded_predictions.append(sample_predictions)
+            # 转换为tensor并调整维度顺序
+            predictions = torch.tensor(padded_predictions).transpose(0, 1).to('cuda:0')  # [n_parscale, batch_size, seq_len-1]
+            
+            scale_features = torch.tensor([d['scale_features'] for d in batch_data]).to('cuda:0')
+            correct_scales = torch.tensor([self.pad_sequence(d['correct_scale'], max_len-1) for d in batch_data]).to('cuda:0')
             
             yield context, predictions, scale_features, correct_scales
     
