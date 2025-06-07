@@ -1,0 +1,9 @@
+*.json
+*.pt
+*.csv
+*.txt
+*.log
+*.log.*
+*.log.*.*
+*.log.*.*.*
+*.log.*.*.*.*
