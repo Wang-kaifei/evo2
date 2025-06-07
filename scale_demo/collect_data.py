@@ -58,7 +58,7 @@ def main():
         with torch.inference_mode():
             # 使用ParScale进行前向传播
             output = parscale_model.forward(input_ids.unsqueeze(0))
-            logits, combined_accuracy, all_predictions = output
+            all_logits, combined_accuracy, all_predictions = output
             
             # 准备特征
             scale_features = torch.stack([
@@ -71,7 +71,8 @@ def main():
                 context=input_ids.unsqueeze(0),
                 predictions=all_predictions,
                 scale_features=scale_features,
-                target=input_ids[1:]
+                target=input_ids[1:],
+                logits=all_logits
             )
         
         if (i + 1) % 10 == 0:

@@ -9,6 +9,8 @@ from data_collector import DataCollector
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch.nn.functional as F
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def evaluate_predictions(predictions, targets, n_parscale):
     """评估预测结果
@@ -80,8 +82,8 @@ def test_original_model(model, sequences):
         # 只保留ATCG序列
         dna_seq = ''.join(c for c in seq if c in 'ATCG')
         
-        # 将序列转换为模型输入格式
-        input_ids = torch.tensor(model.tokenizer.tokenize(dna_seq), dtype=int).to('cuda:0')
+        # 将序列转换为ASCII码
+        input_ids = torch.tensor([ord(c) for c in dna_seq], dtype=int).to('cuda:0')
         
         with torch.inference_mode():
             # 原始模型的前向传播
@@ -117,9 +119,6 @@ def test_original_model(model, sequences):
             
             # 打印每个序列的结果
             print(f"\nSequence {i+1}:")
-            # print(f"Input: {dna_seq}")
-            # print(f"Target tokens: {target_ids.tolist()}")
-            # print(f"Predicted tokens: {pred_tokens.tolist()}")
             print(f"Accuracy: {100*accuracy:.2f}%")
     
     # 计算总体结果
@@ -137,13 +136,13 @@ def test_original_model(model, sequences):
 
 def main():
     # 初始化基础模型
-    model_name = "evo2_7b"
+    model_name = "evo2_1b_base"
     model_path = f"/root/EVO/ckpt/{model_name}.pt"
     model = Evo2(model_name, local_path=model_path)
     
     # 加载reward模型
     reward_model = RewardModel(
-        vocab_size=model.tokenizer.vocab_size,
+        vocab_size=128,  # ASCII码范围是0-127
         hidden_size=768,
         n_parscale=8
     ).to('cuda:0')
@@ -158,13 +157,11 @@ def main():
     data_collector = DataCollector(save_dir="data")
     
     # 加载测试数据
-    test_file = "/root/EVO/evo2/vortex/test/data/output.csv"
+    test_file = "/root/EVO/evo2/vortex/test/data/prompts.csv"
     test_data = pd.read_csv(test_file)
-    test_sequences = test_data['Sequence'].values[:3]  # 取前10个样本
+    test_sequences = test_data['Sequence'].values[:]  # 取前10个样本
     
     print(f"Testing on {len(test_sequences)} sequences...")
-    
-    
     
     print("\n=== Testing Reward Model with ParScale ===")
     
@@ -177,8 +174,8 @@ def main():
         # 只保留ATCG序列
         dna_seq = ''.join(c for c in seq if c in 'ATCG')
         
-        # 将序列转换为模型输入格式
-        input_ids = torch.tensor(model.tokenizer.tokenize(dna_seq), dtype=int).to('cuda:0')
+        # 将序列转换为ASCII码
+        input_ids = torch.tensor([ord(c) for c in dna_seq], dtype=int).to('cuda:0')
         
         with torch.inference_mode():
             # 使用ParScale进行前向传播
@@ -189,33 +186,40 @@ def main():
             seq_len = input_ids.size(0)
             target = input_ids[1:]  # [seq_len-1]
             
-            # 准备特征，确保使用float32类型
+            # 准备特征，确保使用正确的数据类型
             scale_features = torch.stack([
                 parscale_model.noise_scales,
                 parscale_model.dropout_rates
-            ], dim=1).to(dtype=torch.float32)  # [n_parscale, 2]
+            ], dim=1).to(dtype=torch.bfloat16)  # [n_parscale, 2]
             
-            # 使用reward模型预测最佳scale
+            # 计算prediction_scores
+            prediction_scores = torch.zeros(8, 1, seq_len-1, device='cuda:0', dtype=torch.bfloat16)
+            for scale in range(8):
+                # 计算exact match
+                exact_match = (all_predictions_scale[scale, 0] == target).float()
+                
+                # 计算confidence score
+                scale_logits = logits[scale, 0, :-1]  # [seq_len-1, vocab_size]
+                target_logits = scale_logits[torch.arange(seq_len-1), target]
+                probs = F.softmax(scale_logits, dim=-1)
+                target_probs = probs[torch.arange(seq_len-1), target]
+                
+                # 组合scores
+                prediction_scores[scale, 0] = exact_match + target_probs
+            
+            # 使用reward模型预测
             rewards = reward_model(
                 context=input_ids.unsqueeze(0),
                 predictions=all_predictions_scale,
-                scale_features=scale_features
+                scale_features=scale_features,
+                prediction_scores=prediction_scores
             )  # [n_parscale, batch_size, seq_len-1]
             
-            # 选择每个位置预测分数最高的scale
-            best_scales = rewards.squeeze(-1).transpose(0, 1).argmax(dim=1)  # [batch_size, seq_len-1]
-            
-            # 获取每个scale的预测结果
-            batch_size = 1
-            seq_len = input_ids.size(0)
-            predictions = all_predictions_scale  # [n_parscale, batch_size, seq_len-1]
-            
-            # 根据最佳scale选择预测结果
-            best_predictions = torch.zeros(batch_size, seq_len-1, dtype=torch.long, device='cuda:0')
-            for b in range(batch_size):
-                for t in range(seq_len-1):
-                    best_scale = best_scales[b, t]
-                    best_predictions[b, t] = predictions[best_scale, b, t]
+            # 选择每个位置reward分数最高的预测
+            best_predictions = torch.zeros(1, seq_len-1, dtype=torch.long, device='cuda:0')
+            for t in range(seq_len-1):
+                best_scale = rewards[:, 0, t].argmax().item()
+                best_predictions[0, t] = all_predictions_scale[best_scale, 0, t]
             
             # 计算准确率
             correct = (best_predictions[0] == target).sum().item()
@@ -225,7 +229,7 @@ def main():
             results.append({
                 'sequence': dna_seq,
                 'accuracy': accuracy,
-                'best_scales': best_scales[0].cpu().numpy().tolist()
+                'best_scales': rewards.argmax(dim=0)[0].cpu().numpy().tolist()
             })
             
             all_predictions.append(best_predictions[0].cpu().numpy())
@@ -233,13 +237,10 @@ def main():
             
             # 打印每个序列的结果
             print(f"\nSequence {i+1}:")
-            # print(f"Input: {dna_seq}")
-            # print(f"Target tokens: {target.tolist()}")
-            # print(f"Predicted tokens: {best_predictions[0].tolist()}")
             print(f"Accuracy: {accuracy:.2f}%")
             
             # 打印每个scale的使用统计
-            scale_counts = torch.bincount(best_scales[0], minlength=8)
+            scale_counts = torch.bincount(rewards.argmax(dim=0)[0], minlength=8)
             print("\nScale usage statistics:")
             for scale in range(8):
                 print(f"Scale {scale}: {scale_counts[scale].item()} times ({100*scale_counts[scale].item()/(seq_len-1):.1f}%)")
@@ -248,7 +249,7 @@ def main():
             print("\nScale-wise accuracy (when selected):")
             for scale in range(8):
                 # 找出使用该scale的位置
-                scale_mask = (best_scales[0] == scale)
+                scale_mask = (rewards.argmax(dim=0)[0] == scale)
                 if scale_mask.any():
                     scale_preds = best_predictions[0][scale_mask]
                     scale_targets = target[scale_mask]
@@ -272,9 +273,14 @@ def main():
     
     # 保存详细结果
     results_df = pd.DataFrame(results)
-    results_df.to_csv("data/test_results/detailed_results.csv", index=False)
+    # 创建保存目录
+    save_dir = Path("data/test_results")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(save_dir / "detailed_results.csv", index=False)
+    
     # 首先测试原始模型
     orig_accuracies, orig_losses = test_original_model(model, test_sequences)
+    
     # 打印总体结果
     print(f"\nReward Model Overall Results:")
     print(f"Total sequences: {len(test_sequences)}")

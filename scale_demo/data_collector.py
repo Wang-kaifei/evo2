@@ -12,7 +12,7 @@ class DataCollector:
         self.data = []
     
     def collect(self, context: torch.Tensor, predictions: torch.Tensor, 
-                scale_features: torch.Tensor, target: torch.Tensor):
+                scale_features: torch.Tensor, target: torch.Tensor, logits: torch.Tensor = None):
         """收集训练数据
         
         Args:
@@ -20,6 +20,7 @@ class DataCollector:
             predictions: 所有scale的预测 [n_parscale, batch_size, seq_len]
             scale_features: scale特征 [n_parscale, 2]
             target: 目标序列 [batch_size, seq_len-1]
+            logits: 所有scale的logits [n_parscale, batch_size, seq_len, vocab_size]
         """
         batch_size = context.size(0)
         seq_len = context.size(1)
@@ -28,41 +29,39 @@ class DataCollector:
         if target.dim() == 1:
             target = target.unsqueeze(0)  # [seq_len-1] -> [1, seq_len-1]
         
-        # 计算每个流的预测是否正确
-        is_correct = (predictions == target.unsqueeze(0)).float()  # [n_parscale, batch_size, seq_len-1]
+        # 计算每个scale的预测分数
+        prediction_scores = torch.zeros_like(predictions, dtype=torch.float)  # [n_parscale, batch_size, seq_len-1]
         
-        # 对每个位置，找到预测正确的流的索引
-        correct_mask = is_correct > 0  # [n_parscale, batch_size, seq_len-1]
+        # 1. 完全匹配得分
+        target_expanded = target.unsqueeze(0)  # [1, batch_size, seq_len-1]
+        exact_match = (predictions == target_expanded).float()  # [n_parscale, batch_size, seq_len-1]
+        prediction_scores += exact_match
         
-        # 检查每个位置是否所有scale预测都相同
-        all_same = (predictions == predictions[0:1]).all(dim=0)  # [batch_size, seq_len-1]
-        
-        # 对每个位置，找出所有预测正确的scale
-        correct_scales = torch.nonzero(correct_mask, as_tuple=True)[0]  # [n_correct]
-        batch_indices = torch.nonzero(correct_mask, as_tuple=True)[1]  # [n_correct]
-        pos_indices = torch.nonzero(correct_mask, as_tuple=True)[2]  # [n_correct]
-        
-        # 初始化correct_indices为-1（表示没有正确的预测或所有预测相同）
-        correct_indices = torch.full((batch_size, seq_len-1), -1, device=context.device)
-        
-        # 对每个位置，选择一个scale
-        for b in range(batch_size):
-            for t in range(seq_len-1):
-                # 如果所有scale预测都相同，保持-1
-                if all_same[b, t]:
-                    correct_indices[b, t] = -1
-                    continue
-                    
-                # 找出当前位置所有正确的scale
-                pos_mask = (batch_indices == b) & (pos_indices == t)
-                if pos_mask.any():
-                    # 如果有正确的预测，从正确的scale中随机选择一个
-                    correct_scales_pos = correct_scales[pos_mask]
-                    selected_scale = correct_scales_pos[torch.randint(0, len(correct_scales_pos), (1,), device=context.device)]
-                    correct_indices[b, t] = selected_scale
-                else:
-                    # 如果没有正确的预测，保持-1
-                    correct_indices[b, t] = -1
+        # 2. 如果有logits，计算置信度得分
+        if logits is not None:
+            # 调整logits维度，去掉第一个token的预测
+            logits = logits[:, :, 1:, :]  # [n_parscale, batch_size, seq_len-1, vocab_size]
+            
+            # 调整target的维度以匹配logits
+            target_expanded = target.unsqueeze(0).unsqueeze(-1)  # [1, batch_size, seq_len-1, 1]
+            
+            # 获取目标token的logits
+            target_logits = torch.gather(
+                logits, 
+                dim=-1, 
+                index=target_expanded.expand(logits.size(0), -1, -1, -1)
+            ).squeeze(-1)  # [n_parscale, batch_size, seq_len-1]
+            
+            # 将logits转换为概率
+            probs = torch.softmax(logits, dim=-1)  # [n_parscale, batch_size, seq_len-1, vocab_size]
+            target_probs = torch.gather(
+                probs,
+                dim=-1,
+                index=target_expanded.expand(logits.size(0), -1, -1, -1)
+            ).squeeze(-1)  # [n_parscale, batch_size, seq_len-1]
+            
+            # 将概率作为额外的得分
+            prediction_scores += target_probs
         
         # 保存数据
         for b in range(batch_size):
@@ -71,7 +70,7 @@ class DataCollector:
                 'predictions': predictions[:, b].cpu().numpy().tolist(),
                 'scale_features': scale_features.float().cpu().numpy().tolist(),
                 'target': target[b].cpu().numpy().tolist(),
-                'correct_scale': correct_indices[b].cpu().numpy().tolist()
+                'prediction_scores': prediction_scores[:, b].cpu().numpy().tolist()
             }
             self.data.append(sample)
     
@@ -102,7 +101,7 @@ class DataCollector:
 
 class DataLoader:
     """数据加载器"""
-    def __init__(self, data: List[Dict[str, Any]], batch_size: int = 32, max_seq_len: int = 1024):
+    def __init__(self, data: List[Dict[str, Any]], batch_size: int = 32, max_seq_len: int = 3000):
         self.data = data
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
@@ -139,17 +138,21 @@ class DataLoader:
             # 处理预测结果
             n_parscale = len(batch_data[0]['predictions'])  # 获取并行scale数量
             padded_predictions = []
+            padded_scores = []
             for d in batch_data:
                 # 对每个样本的每个scale的预测进行填充
                 sample_predictions = [self.pad_sequence(pred, max_len-1) for pred in d['predictions']]
+                sample_scores = [self.pad_sequence(score, max_len-1) for score in d['prediction_scores']]
                 padded_predictions.append(sample_predictions)
+                padded_scores.append(sample_scores)
+            
             # 转换为tensor并调整维度顺序
             predictions = torch.tensor(padded_predictions).transpose(0, 1).to('cuda:0')  # [n_parscale, batch_size, seq_len-1]
+            scores = torch.tensor(padded_scores).transpose(0, 1).to('cuda:0')  # [n_parscale, batch_size, seq_len-1]
             
             scale_features = torch.tensor([d['scale_features'] for d in batch_data]).to('cuda:0')
-            correct_scales = torch.tensor([self.pad_sequence(d['correct_scale'], max_len-1) for d in batch_data]).to('cuda:0')
             
-            yield context, predictions, scale_features, correct_scales
+            yield context, predictions, scale_features, scores
     
     def __len__(self):
         """返回批次数量"""

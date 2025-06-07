@@ -26,12 +26,8 @@ def collect_training_data(model, sequences, n_parscale=8, save_dir="data"):
         # 只保留ATCG序列
         dna_seq = ''.join(c for c in seq if c in 'ATCG')
         
-        # 将序列转换为模型输入格式
-        input_ids = torch.tensor(model.tokenizer.tokenize(dna_seq), dtype=int).to('cuda:0')
-        
-        # 打印tokenizer的详细信息
-        # print("\nSequence:", dna_seq)
-        # print("Token IDs:", input_ids.tolist())
+        # 将序列转换为ASCII码
+        input_ids = torch.tensor([ord(c) for c in dna_seq], dtype=int).to('cuda:0')
         
         with torch.inference_mode():
             # 使用ParScale进行前向传播
@@ -72,23 +68,13 @@ def main():
                        help="学习率")
     parser.add_argument("--data_dir", type=str, default="data",
                        help="数据保存目录")
-    parser.add_argument("--collect_only", action="store_true",
-                       help="只收集数据，不训练模型")
     
     args = parser.parse_args()
-    
-    # 初始化模型
-    model_path = f"/root/EVO/ckpt/{args.model_name}.pt"
-    config_path = f"/root/EVO/evo2/configs/{args.model_name.replace('_', '-')}.yml"
-    model = Evo2(args.model_name, local_path=model_path)
     
     # 加载训练数据
     collector = DataCollector(args.data_dir)
     data = collector.load("training_data.json")
     print(f"Loaded {len(data)} training samples")
-    
-    if args.collect_only:
-        return
     
     # 准备数据加载器
     train_size = int(0.8 * len(data))
@@ -103,13 +89,15 @@ def main():
     
     # 创建Reward Model
     reward_model = RewardModel(
-        vocab_size=model.tokenizer.vocab_size,
+        vocab_size=128,  # ASCII码范围是0-127
         hidden_size=args.hidden_size,
         n_parscale=args.n_parscale
     ).to('cuda:0')
     
     # 训练模型
     print("Training reward model...")
+    print("Model will learn to predict reward scores that match the prediction_scores")
+    print("These scores combine prediction accuracy and model confidence")
     train_reward_model(
         model=reward_model,
         train_data=train_loader,

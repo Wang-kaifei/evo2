@@ -93,7 +93,10 @@ class SimpleParScaleWrapper:
             input_ids: 输入序列的token ids [batch_size, seq_len]
             
         Returns:
-            tuple: (处理后的logits, combined_accuracy, all_predictions)
+            tuple: (all_logits, combined_accuracy, all_predictions)
+                - all_logits: 所有scale的logits [n_parscale, batch_size, seq_len, vocab_size]
+                - combined_accuracy: 组合准确率
+                - all_predictions: 所有scale的预测 [n_parscale, batch_size, seq_len-1]
         """
         batch_size = input_ids.size(0)
         
@@ -123,6 +126,9 @@ class SimpleParScaleWrapper:
             # 添加扰动后的输出
             scale_output = logits + noise
             scale_outputs.append(scale_output)
+        
+        # 将所有scale的输出堆叠在一起
+        all_logits = torch.stack(scale_outputs)  # [n_parscale, batch_size, seq_len, vocab_size]
         
         # 计算每个尺度的loss
         scale_losses = []
@@ -178,5 +184,5 @@ class SimpleParScaleWrapper:
             # 如果没有奖励模型，使用loss最小的scale
             best_scale_idx = torch.argmin(torch.stack(scale_losses))
             best_output = scale_outputs[best_scale_idx]
-            
-        return best_output, combined_accuracy, all_predictions 
+                
+        return all_logits, combined_accuracy, all_predictions 
